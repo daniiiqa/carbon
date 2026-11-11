@@ -1,0 +1,15 @@
+[package]
+name = "carbon"
+version = "0.1.0"
+edition = "2024"
+description = "El updater de discada: los pasos y sus logs a la izquierda, la discada en la lumbre a la derecha"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+disco = { git = "https://github.com/daniiiqa/disco" }
+portable-pty = "0.9"
+
+[profile.release]
+lto = true
+strip = true
