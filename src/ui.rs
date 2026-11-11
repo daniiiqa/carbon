@@ -27,6 +27,7 @@ enum Edo {
 
 struct PasoUi {
     titulo: String,
+    escena: Escena,
     edo: Edo,
     subs: Vec<String>,
 }
@@ -47,6 +48,18 @@ struct App {
     frame: usize,
     cancelando: bool,
     nuevo: usize,
+    /// la escena que se ve y desde qué cuadro; las que siguen esperan su turno
+    escena_ahora: (Escena, usize),
+    escenas: std::collections::VecDeque<Escena>,
+    /// el último ingrediente (herramienta) que cayó y desde qué cuadro
+    ingrediente: Option<(String, usize)>,
+    /// desde cuándo está el renglón a medias (una pregunta sin detectar se
+    /// contesta igual si se queda esperando)
+    medias_desde: Instant,
+    /// lo último tecleado sin pregunta (no va al comando)
+    tecleado: String,
+    /// el easter egg: desde qué cuadro
+    fiesta: Option<usize>,
 }
 
 const GIRO: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -77,6 +90,7 @@ impl App {
             Ev::Empieza(i) => {
                 if let Some(p) = self.pasos.get_mut(i) {
                     p.edo = Edo::Corre(Instant::now());
+                    self.escenas.push_back(p.escena);
                 }
                 self.scroll = 0;
             }
@@ -89,6 +103,12 @@ impl App {
             }
             Ev::Sub(i, s) => {
                 if let Some(p) = self.pasos.get_mut(i) {
+                    // al instalar, cada herramienta cae a la discada: «rola (YouTube…) → …» es rola
+                    if p.escena == Escena::Ingredientes
+                        && let Some(nombre) = s.split_whitespace().next()
+                    {
+                        self.ingrediente = Some((nombre.trim_end_matches(':').to_string(), self.frame));
+                    }
                     p.subs.push(s);
                 }
             }
@@ -107,12 +127,22 @@ impl App {
                 if !secreta(&m) || !secreta(&self.medias) {
                     self.secreto = 0;
                 }
+                if m != self.medias {
+                    self.medias_desde = Instant::now();
+                }
                 self.medias = m;
             }
             Ev::Fin(ok, msg) => {
                 self.duro = Some(self.inicio.elapsed());
                 self.fin = Some((ok, msg));
                 self.medias.clear();
+                self.escenas.clear();
+                self.escena_ahora = (if ok { Escena::Lista } else { Escena::Apagada }, self.frame);
+                // de vez en cuando, cuando sale bien, la fiesta sola (1 de cada 25)
+                let suerte = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
+                if ok && suerte.is_multiple_of(25) {
+                    self.fiesta = Some(self.frame);
+                }
             }
         }
     }
@@ -125,11 +155,28 @@ impl App {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Up if self.fin.is_some() || self.medias.is_empty() => self.scroll += 1,
             KeyCode::Down if self.fin.is_some() || self.medias.is_empty() => self.scroll = self.scroll.saturating_sub(1),
-            _ if self.fin.is_some() => return matches!(k.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter),
-            KeyCode::Char('c') if ctrl => {
+            KeyCode::Char('c') if ctrl && self.fin.is_none() => {
                 self.cancelando = true;
                 mando.cancelar();
             }
+            // sin pregunta, lo tecleado no va al comando (se quedaría en la pty
+            // y un `read` de más adelante se lo comería): solo cuenta para
+            // el easter egg
+            KeyCode::Char(c) if !ctrl && !self.acepta() => {
+                self.tecleado.push(c);
+                let n = self.tecleado.chars().count();
+                if n > 8 {
+                    self.tecleado = self.tecleado.chars().skip(n - 8).collect();
+                }
+                let t = self.tecleado.to_lowercase();
+                if t.ends_with("ajua") || t.ends_with("ajúa") {
+                    self.fiesta = Some(self.frame);
+                    self.tecleado.clear();
+                }
+                return self.fin.is_some() && c == 'q';
+            }
+            _ if self.fin.is_some() => return matches!(k.code, KeyCode::Esc | KeyCode::Enter),
+            _ if !self.acepta() => {}
             KeyCode::Enter => mando.teclear(b"\r"),
             KeyCode::Backspace => {
                 self.secreto = self.secreto.saturating_sub(1);
@@ -147,11 +194,29 @@ impl App {
         false
     }
 
-    fn escena(&self) -> Escena {
-        match &self.fin {
-            Some((true, _)) => Escena::Lista,
-            Some((false, _)) => Escena::Apagada,
-            None => Escena::Meneo,
+    /// ¿Hay algo esperando respuesta? Una pregunta, o un renglón a medias que
+    /// ya lleva un segundo quieto (por si es una pregunta que no se reconoce).
+    fn acepta(&self) -> bool {
+        self.fin.is_none() && (pregunta(&self.medias) || (!self.medias.is_empty() && self.medias_desde.elapsed() > Duration::from_secs(1)))
+    }
+
+    /// La escena de ahora y cuántos cuadros lleva. Pasa a la siguiente cuando
+    /// la de ahora ya cumplió su mínimo (el cerillo y la troca se ven enteros).
+    fn escena(&mut self) -> (Escena, usize) {
+        let (e, desde) = self.escena_ahora;
+        if !self.escenas.is_empty() && self.frame - desde >= e.minimo() {
+            let sig = self.escenas.pop_front().expect("hay");
+            self.escena_ahora = (sig, self.frame);
+        }
+        let (e, desde) = self.escena_ahora;
+        (e, self.frame - desde)
+    }
+
+    fn extra(&self) -> arte::Extra {
+        arte::Extra {
+            commits: self.nuevo,
+            ingrediente: self.ingrediente.as_ref().map(|(n, desde)| (n.clone(), self.frame - desde)),
+            fiesta: self.fiesta.map(|d| self.frame - d).filter(|s| *s < 64),
         }
     }
 
@@ -182,7 +247,8 @@ impl App {
         };
         self.izquierda(f, izq, mando);
         if con_arte {
-            self.derecha(f, der);
+            let (escena, t) = self.escena();
+            self.derecha(f, der, escena, t);
         }
 
         let ayuda = match &self.fin {
@@ -283,7 +349,7 @@ impl App {
         }
     }
 
-    fn derecha(&self, f: &mut Frame, area: Rect) {
+    fn derecha(&self, f: &mut Frame, area: Rect, escena: Escena, t_escena: usize) {
         let t = self.look.theme;
         let b = self.look.block(false);
         let dentro = b.inner(area);
@@ -291,7 +357,7 @@ impl App {
         let alto_arte = arte::H as u16;
         let [_, dibujo, _, info] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(alto_arte), Constraint::Length(1), Constraint::Fill(1)]).areas(dentro);
-        f.render_widget(Paragraph::new(arte::cuadro(self.escena(), self.frame)).alignment(Alignment::Center), dibujo);
+        f.render_widget(Paragraph::new(arte::cuadro(escena, t_escena, self.frame, &self.extra())).alignment(Alignment::Center), dibujo);
 
         let mut lineas: Vec<Line> = Vec::new();
         match &self.fin {
@@ -300,10 +366,18 @@ impl App {
                 let total = self.pasos.len().max(1);
                 let ahora = self.pasos.iter().find(|p| matches!(p.edo, Edo::Corre(_)));
                 let etiqueta = ahora.map(|p| p.subs.last().cloned().unwrap_or_else(|| p.titulo.clone())).unwrap_or_default();
-                lineas.push(Line::from(Span::styled(
-                    self.look.tx(&format!("{} {}", self.t("meneando:", "stirring:"), cortar(&etiqueta, 24))),
-                    Style::new().fg(t.fg),
-                )));
+                // lo que dice depende de la escena (va con lo que se ve arriba)
+                let texto = match escena {
+                    Escena::Prender => self.t("prendiendo el carbón…", "lighting the charcoal…").to_string(),
+                    Escena::Troca if t_escena < 27 => self.t("ahí viene la troca…", "here comes the truck…").to_string(),
+                    Escena::Troca => self.t("llegó la carga", "the load is here").to_string(),
+                    Escena::Ingredientes => match &self.ingrediente {
+                        Some((n, _)) => format!("{} {}", self.t("echándole:", "adding:"), cortar(n, 22)),
+                        None => self.t("picando los ingredientes…", "chopping the ingredients…").to_string(),
+                    },
+                    _ => format!("{} {}", self.t("meneando:", "stirring:"), cortar(&etiqueta, 24)),
+                };
+                lineas.push(Line::from(Span::styled(self.look.tx(&texto), Style::new().fg(t.fg))));
                 lineas.push(Line::default());
                 let ancho = dentro.width.saturating_sub(10) as usize;
                 let (hecho, falta) = self.look.bar(hechos as f64 / total as f64, ancho);
@@ -332,7 +406,7 @@ impl App {
 /// Corre el plan con la pantalla. Devuelve si salió bien.
 pub fn correr(pasos: Vec<Paso>, es: bool, prueba: bool) -> bool {
     let mando = Mando::default();
-    let titulos: Vec<PasoUi> = pasos.iter().map(|p| PasoUi { titulo: p.titulo.clone(), edo: Edo::Espera, subs: Vec::new() }).collect();
+    let titulos: Vec<PasoUi> = pasos.iter().map(|p| PasoUi { titulo: p.titulo.clone(), escena: p.escena, edo: Edo::Espera, subs: Vec::new() }).collect();
     if !std::io::stdout().is_terminal() {
         return sin_pantalla(pasos, es, prueba, mando);
     }
@@ -351,6 +425,12 @@ pub fn correr(pasos: Vec<Paso>, es: bool, prueba: bool) -> bool {
         frame: 0,
         cancelando: false,
         nuevo: 0,
+        escena_ahora: (Escena::Meneo, 0),
+        escenas: std::collections::VecDeque::new(),
+        ingrediente: None,
+        medias_desde: Instant::now(),
+        tecleado: String::new(),
+        fiesta: None,
     };
     let mut term = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -442,7 +522,7 @@ mod tests {
             pasos: ["preparar", "bajar discada", "instalar lo nuevo", "recargar"]
                 .iter()
                 .take(n)
-                .map(|t| PasoUi { titulo: t.to_string(), edo: Edo::Espera, subs: Vec::new() })
+                .map(|t| PasoUi { titulo: t.to_string(), escena: Escena::Meneo, edo: Edo::Espera, subs: Vec::new() })
                 .collect(),
             log: Vec::new(),
             scroll: 0,
@@ -454,6 +534,12 @@ mod tests {
             frame: 3,
             cancelando: false,
             nuevo: 0,
+            escena_ahora: (Escena::Meneo, 0),
+            escenas: std::collections::VecDeque::new(),
+            ingrediente: None,
+            medias_desde: Instant::now(),
+            tecleado: String::new(),
+            fiesta: None,
         }
     }
 
@@ -507,6 +593,41 @@ mod tests {
         a.evento(Ev::Fin(true, "discada actualizada: 1 cambios nuevos.".into()));
         let s = pantalla(&mut a);
         assert!(s.contains("lista") && s.contains("1 cambios nuevos"));
+    }
+
+    #[test]
+    fn el_cerillo_se_ve_entero_aunque_preparar_acabe_luego_luego() {
+        let mut a = app(4);
+        a.pasos[0].escena = Escena::Prender;
+        a.pasos[1].escena = Escena::Troca;
+        a.evento(Ev::Empieza(0));
+        assert_eq!(a.escena().0, Escena::Prender);
+        a.evento(Ev::Termina(0, true));
+        a.evento(Ev::Empieza(1));
+        // preparar ya acabó, pero el cerillo sigue hasta su mínimo
+        a.frame += 5;
+        assert_eq!(a.escena().0, Escena::Prender);
+        a.frame += Escena::Prender.minimo();
+        assert_eq!(a.escena(), (Escena::Troca, 0));
+    }
+
+    #[test]
+    fn sin_pregunta_lo_tecleado_no_es_respuesta_y_ajua_es_fiesta() {
+        let m = Mando::default();
+        let mut a = app(1);
+        assert!(!a.acepta());
+        for c in "ajua".chars() {
+            a.tecla(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &m);
+        }
+        assert!(a.fiesta.is_some());
+        // con una pregunta, sí es respuesta (y no cuenta para la fiesta)
+        a.evento(Ev::Medias("¿Seguir? [S/n] ".into()));
+        assert!(a.acepta());
+        // un renglón a medias que no parece pregunta: cuenta hasta que se queda quieto
+        a.evento(Ev::Medias("bajando 50%".into()));
+        assert!(!a.acepta());
+        a.medias_desde -= Duration::from_secs(2);
+        assert!(a.acepta());
     }
 
     /// `cargo test vistazo -- --ignored --nocapture`: la pantalla en texto.

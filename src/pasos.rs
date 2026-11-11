@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 
+use crate::arte::Escena;
 use crate::linea::Armador;
 
 /// Qué clase de renglón es (la pantalla los pinta distinto).
@@ -98,12 +99,22 @@ type Hacer = Box<dyn FnOnce(&mut Ctx) -> Result<(), String> + Send>;
 
 pub struct Paso {
     pub titulo: String,
+    /// lo que se ve a la derecha mientras corre
+    pub escena: Escena,
     hacer: Hacer,
 }
 
 impl Paso {
     fn new(titulo: &str, hacer: impl FnOnce(&mut Ctx) -> Result<(), String> + Send + 'static) -> Paso {
-        Paso { titulo: titulo.to_string(), hacer: Box::new(hacer) }
+        // cada paso con su escena: el carbón al preparar, la troca al bajar,
+        // los ingredientes al instalar; lo demás, la discada meneándose
+        let escena = match titulo {
+            "preparar" | "prepare" => Escena::Prender,
+            "bajar discada" | "download discada" => Escena::Troca,
+            "instalar lo nuevo" | "install what's new" => Escena::Ingredientes,
+            _ => Escena::Meneo,
+        };
+        Paso { titulo: titulo.to_string(), escena, hacer: Box::new(hacer) }
     }
 }
 
