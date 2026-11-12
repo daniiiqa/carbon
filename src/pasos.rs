@@ -407,9 +407,20 @@ pub fn plan(modo: &Modo, es: bool) -> Vec<Paso> {
                     }
                     Ok(())
                 }),
-                Paso::new(t("poner tu look", "apply your look"), move |c| match &cur2 {
-                    Some(l) => c.correr(&[&lena(), "apply", l], None),
-                    None => Ok(()),
+                // las herramientas también (carbon, empalme, bicho…): antes aquí
+                // solo se ponía el look y en esta máquina nunca se actualizaban.
+                // install.sh corriendo desde ~/.config no copia nada (no es
+                // máquina nueva): instala lo que falte, baja las apps que
+                // cambiaron y pone el look actual
+                Paso::new(t("instalar lo nuevo", "install what's new"), move |c| {
+                    let sh = home().join(".config/install.sh");
+                    if sh.is_file() {
+                        c.correr(&["bash", &sh.to_string_lossy(), "--update"], None).map_err(|_| c.t("install.sh --update falló", "install.sh --update failed"))
+                    } else if let Some(l) = &cur2 {
+                        c.correr(&[&lena(), "apply", l], None)
+                    } else {
+                        Ok(())
+                    }
                 }),
                 Paso::new(t("recargar", "reload"), |c| c.sh(RECARGAR)),
             ]
